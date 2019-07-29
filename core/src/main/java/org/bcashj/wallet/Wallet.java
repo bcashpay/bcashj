@@ -3922,6 +3922,23 @@ public class Wallet extends BaseTaggableObject
         checkState(broadcaster != null, "No transaction broadcaster is configured");
         return sendCoins(broadcaster, request);
     }
+    
+    public SendResult sendCompletedTx(Transaction tx) throws InsufficientMoneyException {
+        TransactionBroadcaster broadcaster = vTransactionBroadcaster;
+        checkState(broadcaster != null, "No transaction broadcaster is configured");
+        commitTx(tx);
+        SendResult result = new SendResult();
+        result.tx = tx;
+        // The tx has been committed to the pending pool by this point (via sendCoinsOffline -> commitTx), so it has
+        // a txConfidenceListener registered. Once the tx is broadcast the peers will update the memory pool with the
+        // count of seen peers, the memory pool will update the transaction confidence object, that will invoke the
+        // txConfidenceListener which will in turn invoke the wallets event listener onTransactionConfidenceChanged
+        // method.
+        result.broadcast = broadcaster.broadcastTransaction(tx);
+        result.broadcastComplete = result.broadcast.future();
+        return result;
+        
+    }
 
     /**
      * Sends coins to the given address, via the given {@link Peer}. Change is returned to {@link Wallet#currentChangeAddress()}.
@@ -4161,6 +4178,13 @@ public class Wallet extends BaseTaggableObject
     public List<TransactionOutput> calculateAllSpendCandidates() {
         return calculateAllSpendCandidates(true, true);
     }
+    /**
+     * Returns a list of the outputs that can potentially be spent, i.e. that we have the keys for and are unspent
+     * according to our knowledge of the block chain.
+     */
+    public List<TransactionOutput> calculateAddressSpendCandidates(Address address) {
+        return calculateAdressSpendCandidates(address, true, true);
+    }
 
     /** @deprecated Use {@link #calculateAllSpendCandidates(boolean, boolean)} or the zero-parameter form instead. */
     @Deprecated
@@ -4177,6 +4201,35 @@ public class Wallet extends BaseTaggableObject
      * @param excludeUnsignable Whether to ignore outputs that we are tracking but don't have the keys to sign for.
      */
     public List<TransactionOutput> calculateAllSpendCandidates(boolean excludeImmatureCoinbases, boolean excludeUnsignable) {
+        lock.lock();
+        try {
+            List<TransactionOutput> candidates;
+            if (vUTXOProvider == null) {
+                candidates = new ArrayList<TransactionOutput>(myUnspents.size());
+                for (TransactionOutput output : myUnspents) {
+                    if (excludeUnsignable && !canSignFor(output.getScriptPubKey())) continue;
+                    Transaction transaction = checkNotNull(output.getParentTransaction());
+                    if (excludeImmatureCoinbases && !transaction.isMature())
+                        continue;
+                    candidates.add(output);
+                }
+            } else {
+                candidates = calculateAllSpendCandidatesFromUTXOProvider(excludeImmatureCoinbases);
+            }
+            return candidates;
+        } finally {
+            lock.unlock();
+        }
+    }
+    /**
+     * Returns a list of all outputs that are being tracked by this wallet either from the {@link UTXOProvider}
+     * (in this case the existence or not of private keys is ignored), or the wallets internal storage (the default)
+     * taking into account the flags.
+     *
+     * @param excludeImmatureCoinbases Whether to ignore coinbase outputs that we will be able to spend in future once they mature.
+     * @param excludeUnsignable Whether to ignore outputs that we are tracking but don't have the keys to sign for.
+     */
+    public List<TransactionOutput> calculateAdressSpendCandidates(Address address, boolean excludeImmatureCoinbases, boolean excludeUnsignable) {
         lock.lock();
         try {
             List<TransactionOutput> candidates;
